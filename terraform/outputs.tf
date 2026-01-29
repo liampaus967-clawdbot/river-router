@@ -36,9 +36,10 @@ output "database_url" {
   value       = "postgresql://${aws_db_instance.main.username}:****@${aws_db_instance.main.endpoint}/${aws_db_instance.main.db_name}"
 }
 
-output "database_url_ssm_param" {
-  description = "SSM parameter name containing full connection string"
-  value       = aws_ssm_parameter.db_connection_string.name
+output "database_url_full" {
+  description = "Full database connection URL (with password - sensitive)"
+  value       = "postgresql://${aws_db_instance.main.username}:${var.db_password}@${aws_db_instance.main.endpoint}/${aws_db_instance.main.db_name}"
+  sensitive   = true
 }
 
 # ------------------------------------------------------------
@@ -92,9 +93,9 @@ output "connection_instructions" {
        
        export DATABASE_URL="postgresql://${aws_db_instance.main.username}:<password>@${aws_db_instance.main.endpoint}/${aws_db_instance.main.db_name}"
     
-    3. Or retrieve from SSM Parameter Store:
+    3. To get the full connection string with password:
        
-       aws ssm get-parameter --name "/${var.project_name}/db/connection_string" --with-decryption --query 'Parameter.Value' --output text
+       terraform output -raw database_url_full
     
     ============================================================
   EOT

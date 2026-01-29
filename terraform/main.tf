@@ -65,19 +65,9 @@ resource "aws_security_group" "rds" {
   description = "Security group for River Router RDS"
   vpc_id      = data.aws_vpc.default.id
 
-  # PostgreSQL from EC2 security group
+  # PostgreSQL from allowed CIDR (your IP and/or EC2)
   ingress {
-    description     = "PostgreSQL from EC2"
-    from_port       = 5432
-    to_port         = 5432
-    protocol        = "tcp"
-    security_groups = var.existing_ec2_sg_id != "" ? [var.existing_ec2_sg_id] : []
-    cidr_blocks     = var.existing_ec2_sg_id == "" ? [var.allowed_cidr] : []
-  }
-
-  # PostgreSQL from your IP (for direct access during development)
-  ingress {
-    description = "PostgreSQL from allowed IP"
+    description = "PostgreSQL access"
     from_port   = 5432
     to_port     = 5432
     protocol    = "tcp"
@@ -165,10 +155,11 @@ resource "aws_db_parameter_group" "postgres" {
   name   = "${var.project_name}-postgres16"
   family = "postgres16"
 
-  # PostGIS requires shared_preload_libraries
+  # pg_stat_statements for query monitoring (requires reboot)
   parameter {
-    name  = "shared_preload_libraries"
-    value = "pg_stat_statements"
+    name         = "shared_preload_libraries"
+    value        = "pg_stat_statements"
+    apply_method = "pending-reboot"
   }
 
   tags = {
@@ -251,27 +242,22 @@ resource "aws_instance" "api" {
 }
 
 # ============================================================
-# SSM Parameter Store (secure credential storage)
+# SSM Parameter Store (optional - requires IAM permissions)
 # ============================================================
-
-resource "aws_ssm_parameter" "db_password" {
-  name        = "/${var.project_name}/db/password"
-  description = "River Router database password"
-  type        = "SecureString"
-  value       = var.db_password
-
-  tags = {
-    Project = var.project_name
-  }
-}
-
-resource "aws_ssm_parameter" "db_connection_string" {
-  name        = "/${var.project_name}/db/connection_string"
-  description = "River Router database connection string"
-  type        = "SecureString"
-  value       = "postgresql://${var.db_username}:${var.db_password}@${aws_db_instance.main.endpoint}/${var.db_name}"
-
-  tags = {
-    Project = var.project_name
-  }
-}
+# Uncomment if your IAM user has ssm:PutParameter permission
+#
+# resource "aws_ssm_parameter" "db_password" {
+#   name        = "/${var.project_name}/db/password"
+#   description = "River Router database password"
+#   type        = "SecureString"
+#   value       = var.db_password
+#   tags = { Project = var.project_name }
+# }
+#
+# resource "aws_ssm_parameter" "db_connection_string" {
+#   name        = "/${var.project_name}/db/connection_string"
+#   description = "River Router database connection string"
+#   type        = "SecureString"
+#   value       = "postgresql://${var.db_username}:${var.db_password}@${aws_db_instance.main.endpoint}/${var.db_name}"
+#   tags = { Project = var.project_name }
+# }
