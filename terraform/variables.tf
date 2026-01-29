@@ -31,7 +31,7 @@ variable "allowed_cidr" {
 variable "rds_instance_class" {
   description = "RDS instance class"
   type        = string
-  default     = "db.t3.small"  # 2 vCPU, 2 GB RAM, ~$30/mo
+  default     = "db.t3.micro"  # 1 GB RAM, free tier eligible
 }
 
 variable "rds_storage_gb" {

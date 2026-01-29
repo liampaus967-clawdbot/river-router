@@ -29,10 +29,10 @@ aws_region = "us-east-1"
 project_name = "river-router"
 
 # RDS instance size
-# - db.t3.micro  = 1 GB RAM, ~$15/mo (tight but works for MVP)
-# - db.t3.small  = 2 GB RAM, ~$30/mo (recommended)
+# - db.t3.micro  = 1 GB RAM, FREE TIER eligible
+# - db.t3.small  = 2 GB RAM, ~$30/mo (requires paid account)
 # - db.t3.medium = 4 GB RAM, ~$60/mo (comfortable)
-rds_instance_class = "db.t3.small"
+rds_instance_class = "db.t3.micro"
 
 # RDS storage (GB)
 rds_storage_gb     = 50
