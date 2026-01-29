@@ -196,13 +196,13 @@ resource "aws_db_instance" "main" {
   port                   = 5432
 
   # Backup & Maintenance
-  backup_retention_period = 7
+  backup_retention_period = 1  # Minimum for automated backups (free tier limit)
   backup_window           = "03:00-04:00"
   maintenance_window      = "Mon:04:00-Mon:05:00"
 
-  # Performance Insights (free tier)
-  performance_insights_enabled = true
-  performance_insights_retention_period = 7
+  # Performance Insights (disabled for free tier compatibility)
+  performance_insights_enabled          = false
+  # performance_insights_retention_period = 7
 
   # Other
   multi_az               = false  # Set true for production
