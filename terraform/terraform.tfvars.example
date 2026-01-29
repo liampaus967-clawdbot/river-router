@@ -1,0 +1,65 @@
+# ============================================================
+# River Router - Terraform Variables
+# ============================================================
+# Copy this file to terraform.tfvars and fill in your values:
+#   cp terraform.tfvars.example terraform.tfvars
+#
+# NEVER commit terraform.tfvars to git (it contains secrets)
+# ============================================================
+
+# ------------------------------------------------------------
+# Required
+# ------------------------------------------------------------
+
+# Database password - use a strong password!
+db_password = "CHANGE_ME_use_a_strong_password_123!"
+
+# Your public IP for security group access (find at: curl ifconfig.me)
+# Format: "1.2.3.4/32" for single IP, or "0.0.0.0/0" for any (not recommended)
+allowed_cidr = "YOUR_IP_HERE/32"
+
+# ------------------------------------------------------------
+# Optional - Defaults are fine for MVP
+# ------------------------------------------------------------
+
+# AWS region
+aws_region = "us-east-1"
+
+# Project name (used in resource naming)
+project_name = "river-router"
+
+# RDS instance size
+# - db.t3.micro  = 1 GB RAM, ~$15/mo (tight but works for MVP)
+# - db.t3.small  = 2 GB RAM, ~$30/mo (recommended)
+# - db.t3.medium = 4 GB RAM, ~$60/mo (comfortable)
+rds_instance_class = "db.t3.small"
+
+# RDS storage (GB)
+rds_storage_gb     = 50
+rds_max_storage_gb = 100
+
+# Database credentials
+db_name     = "river_router"
+db_username = "river_router"
+
+# Skip final snapshot on deletion (set false for production)
+skip_final_snapshot = true
+
+# ------------------------------------------------------------
+# EC2 (Optional - set create_ec2 = true to provision)
+# ------------------------------------------------------------
+
+# Set to true if you want Terraform to create a new EC2 instance
+# Set to false if you're using your existing EC2
+create_ec2 = false
+
+# If using existing EC2, provide its security group ID
+# (so RDS security group can allow access from it)
+# Find in AWS Console: EC2 > Instances > Security tab
+existing_ec2_sg_id = ""  # e.g., "sg-0123456789abcdef0"
+
+# If creating new EC2:
+ec2_instance_type = "t3.large"
+ec2_volume_size   = 100
+ec2_key_name      = ""  # Your EC2 key pair name
+ssh_port          = 22  # Change to non-standard port if desired
