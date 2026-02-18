@@ -6,9 +6,10 @@ Scripts for populating USGS gauge data and flow statistics.
 
 | Script | Purpose | Frequency |
 |--------|---------|-----------|
-| `usgs_gauge_ingest.py` | Fetch gauge metadata & current readings | Hourly (cron) |
-| `nwm_realtime_ingest.py` | Fetch NWM forecast data | Hourly (cron) |
+| `usgs_gauges.py` | Fetch gauge metadata & current readings | Hourly (cron) |
 | `usgs_percentiles.py` | Generate DOY percentile stats | Monthly/Manual |
+| `usgs_live_conditions.py` | Live flow status, trends, temp | Hourly (cron) |
+| `nwm_realtime_ingest.py` | Fetch NWM velocity data | Hourly (cron) |
 
 ---
 
@@ -93,7 +94,63 @@ psycopg2
 
 Based on [FGP (Flow Gauge Percentiles)](https://github.com/lpaus967/FGP) architecture:
 - **Pipeline A**: Batch generation of reference statistics (this script)
-- **Pipeline B**: Live comparison of current flow to reference (future: API endpoint)
+- **Pipeline B**: Live comparison of current flow to reference (usgs_live_conditions.py)
+
+---
+
+## usgs_live_conditions.py
+
+Fetches live readings, compares to percentiles, detects trends.
+
+### Features
+
+- **Flow Status**: Compares current flow to DOY percentiles (Normal, Below Normal, etc.)
+- **Drought Classification**: USDM methodology (D0-D4)
+- **Flow Trend**: Rising/Falling/Stable based on 24h history
+- **Temperature Trend**: Rising/Falling/Stable
+
+### Usage
+
+```bash
+# All gauges (may be slow)
+python app/data/usgs_live_conditions.py
+
+# Single state
+python app/data/usgs_live_conditions.py --state VT
+
+# Specific sites
+python app/data/usgs_live_conditions.py --sites 01010000,01010500
+```
+
+### Output Table
+
+```sql
+usgs_live_conditions (
+    site_no         VARCHAR(15) PRIMARY KEY,
+    timestamp       TIMESTAMPTZ,
+    flow_cfs        DOUBLE PRECISION,
+    gage_height_ft  DOUBLE PRECISION,
+    water_temp_c    DOUBLE PRECISION,
+    percentile      DOUBLE PRECISION,  -- 0-100
+    flow_status     VARCHAR(50),       -- Normal, Below Normal, etc.
+    drought_status  VARCHAR(50),       -- D0-D4 or NULL
+    flow_trend      VARCHAR(20),       -- rising, falling, stable, unknown
+    flow_trend_rate DOUBLE PRECISION,  -- % per hour
+    temp_trend      VARCHAR(20),
+    temp_trend_rate DOUBLE PRECISION,
+    hours_since_peak DOUBLE PRECISION,
+    updated_at      TIMESTAMPTZ
+)
+```
+
+### Trend Detection
+
+| Trend | Condition |
+|-------|-----------|
+| Rising | >10% total increase over 24h |
+| Falling | >10% total decrease over 24h |
+| Stable | Within ±10% |
+| Unknown | <4 data points |
 
 ---
 
