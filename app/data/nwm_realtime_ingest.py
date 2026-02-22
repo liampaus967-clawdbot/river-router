@@ -48,7 +48,7 @@ except ImportError:
 
 # Database connection
 DATABASE_URL = os.environ.get('DATABASE_URL', 
-    'postgresql://river_router:Pacific1ride@river-router-db.c6xmmyu04pdo.us-east-1.rds.amazonaws.com:5432/river_router')
+    'postgresql://driftwise:Pacific1ride@driftwise-dev.ck52oyeoe285.us-east-1.rds.amazonaws.com:5432/driftwise')
 
 # AWS NWM bucket (public, no auth needed)
 NWM_BUCKET = 'noaa-nwm-pds'

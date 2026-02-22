@@ -20,7 +20,7 @@ from botocore.exceptions import ClientError
 logger = logging.getLogger(__name__)
 
 # Config from environment
-S3_BUCKET = os.environ.get('S3_BUCKET', 'river-router-data')
+S3_BUCKET = os.environ.get('S3_BUCKET', 'driftwise-flowgauge-data')
 AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
 
 # S3 prefixes

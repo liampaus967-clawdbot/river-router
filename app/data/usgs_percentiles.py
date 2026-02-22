@@ -183,9 +183,9 @@ def process_site(site_id: str) -> Optional[pd.DataFrame]:
     return calculate_percentiles_hyswap(df, site_id)
 
 
-def generate_state_percentiles(state_code: str, s3_client: S3Client) -> dict:
+def generate_state_percentiles(state_code: str, s3_client: S3Client, dry_run: bool = False) -> dict:
     """Generate percentiles for all sites in a state and upload to S3."""
-    logger.info(f"📊 Processing state: {state_code}")
+    logger.info(f"📊 Processing state: {state_code}" + (" [DRY RUN]" if dry_run else ""))
     
     sites = get_sites_for_state(state_code)
     if not sites:
@@ -216,14 +216,19 @@ def generate_state_percentiles(state_code: str, s3_client: S3Client) -> dict:
     combined_df = pd.concat(results, ignore_index=True)
     logger.info(f"   Generated stats for {len(results)} sites ({len(combined_df)} rows)")
     
-    # Upload to S3
-    success = s3_client.upload_reference_stats(combined_df, state_code)
+    # Upload to S3 (skip if dry run)
+    if dry_run:
+        logger.info(f"   🔍 DRY RUN: Would upload {len(combined_df)} rows to S3")
+        success = True
+    else:
+        success = s3_client.upload_reference_stats(combined_df, state_code)
     
     return {
         "state": state_code,
         "sites": len(results),
         "rows": len(combined_df),
-        "uploaded": success
+        "uploaded": success,
+        "dry_run": dry_run
     }
 
 
@@ -233,6 +238,7 @@ def main():
     parser.add_argument('--state', type=str, help='State code (e.g., VT)')
     parser.add_argument('--all', action='store_true', help='Process all states')
     parser.add_argument('--bucket', type=str, help='S3 bucket name')
+    parser.add_argument('--dry-run', action='store_true', help='Test without uploading to S3')
     args = parser.parse_args()
     
     print("=" * 60)
@@ -242,9 +248,13 @@ def main():
     print("=" * 60)
     
     s3_client = S3Client(bucket_name=args.bucket)
+    dry_run = args.dry_run
+    
+    if dry_run:
+        print("🔍 DRY RUN MODE - No S3 uploads will occur")
     
     if args.state:
-        result = generate_state_percentiles(args.state.upper(), s3_client)
+        result = generate_state_percentiles(args.state.upper(), s3_client, dry_run=dry_run)
         print(f"\n✅ {result}")
     elif args.all:
         total_sites = 0
@@ -252,7 +262,7 @@ def main():
         
         for state in ALL_STATES:
             try:
-                result = generate_state_percentiles(state, s3_client)
+                result = generate_state_percentiles(state, s3_client, dry_run=dry_run)
                 total_sites += result.get("sites", 0)
                 total_rows += result.get("rows", 0)
             except Exception as e:
