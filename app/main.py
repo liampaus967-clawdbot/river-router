@@ -68,5 +68,8 @@ async def health_check():
 
 
 # Import and include routers
-# from app.api.routes import router as api_router
-# app.include_router(api_router, prefix="/api/v1")
+from app.api.routes import router as api_router
+from app.api.gauges import router as gauges_router
+
+app.include_router(api_router, prefix="/api/v1")
+app.include_router(gauges_router, prefix="/api/v1")
