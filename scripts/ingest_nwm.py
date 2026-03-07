@@ -22,7 +22,7 @@ from psycopg2.extras import execute_values
 DATABASE_URL = os.environ.get('DATABASE_URL', 
     'postgresql://postgres:driftingInVermont@driftwise-west.cfs02ime4lxt.us-west-2.rds.amazonaws.com:5432/gisdata')
 NWM_BASE_URL = 'https://noaa-nwm-pds.s3.amazonaws.com'
-BATCH_SIZE = 50000  # Insert in batches
+BATCH_SIZE = 10000  # Insert in batches (smaller to avoid OOM)
 
 def get_latest_nwm_url():
     """Find the latest NWM channel_rt file URL."""
