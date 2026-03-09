@@ -953,3 +953,131 @@ COMMENT ON TABLE us.river_reach_profiles IS
 
 COMMENT ON FUNCTION find_float_route IS
 'Find a contiguous route on a river matching target float time. Returns ordered reaches with access point info.';
+
+-- ============================================================================
+-- ADDENDUM: River Identification
+-- ============================================================================
+-- Rivers are uniquely identified by gnis_name + state combination
+-- The river_summary table should use this for lookups
+
+-- Add unique constraint on name + state
+ALTER TABLE us.river_summary 
+    DROP CONSTRAINT IF EXISTS river_summary_gnis_name_key;
+ALTER TABLE us.river_summary 
+    ADD CONSTRAINT river_summary_name_state_unique UNIQUE (gnis_name, primary_state);
+
+-- Add composite index for fast lookups
+CREATE INDEX IF NOT EXISTS idx_rs_name_state 
+    ON us.river_summary(gnis_name, primary_state);
+
+CREATE INDEX IF NOT EXISTS idx_rrp_name_state 
+    ON us.river_reach_profiles(gnis_name, state);
+
+-- ============================================================================
+-- UPDATED ROUTE FINDING FUNCTION (with state parameter)
+-- ============================================================================
+DROP FUNCTION IF EXISTS find_float_route;
+
+CREATE OR REPLACE FUNCTION find_float_route(
+    p_river_name TEXT,
+    p_state TEXT,                    -- Required: state to disambiguate
+    p_target_hours NUMERIC,
+    p_tolerance_hours NUMERIC DEFAULT 0.5,
+    p_max_difficulty INT DEFAULT 5
+) RETURNS TABLE (
+    route_id INT,
+    comid BIGINT,
+    gnis_name TEXT,
+    state TEXT,
+    reach_order INT,
+    length_km NUMERIC,
+    float_hours NUMERIC,
+    cumulative_hours NUMERIC,
+    difficulty_level INT,
+    has_put_in BOOLEAN,
+    has_take_out BOOLEAN,
+    access_points JSONB
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH ordered_reaches AS (
+        SELECT 
+            rrp.comid,
+            rrp.gnis_name,
+            rrp.state,
+            ROW_NUMBER() OVER (ORDER BY rrp.hydroseq DESC) as reach_order,
+            rrp.length_km,
+            rrp.estimated_float_hours,
+            rrp.difficulty_level,
+            rrp.has_put_in,
+            rrp.has_take_out,
+            rrp.access_points as aps
+        FROM us.river_reach_profiles rrp
+        WHERE rrp.gnis_name ILIKE p_river_name
+          AND rrp.state = p_state
+          AND COALESCE(rrp.difficulty_level, 1) <= p_max_difficulty
+        ORDER BY rrp.hydroseq DESC
+    ),
+    route_windows AS (
+        SELECT 
+            r1.reach_order as start_reach,
+            r2.reach_order as end_reach,
+            SUM(r3.estimated_float_hours) as total_hours,
+            SUM(r3.length_km) as total_km
+        FROM ordered_reaches r1
+        CROSS JOIN ordered_reaches r2
+        JOIN ordered_reaches r3 
+            ON r3.reach_order BETWEEN r1.reach_order AND r2.reach_order
+        WHERE r2.reach_order >= r1.reach_order
+        GROUP BY r1.reach_order, r2.reach_order
+        HAVING SUM(r3.estimated_float_hours) BETWEEN (p_target_hours - p_tolerance_hours) 
+                                                  AND (p_target_hours + p_tolerance_hours)
+    ),
+    best_route AS (
+        SELECT 
+            rw.*,
+            (SELECT or1.has_put_in FROM ordered_reaches or1 WHERE or1.reach_order = rw.start_reach) as start_has_access,
+            (SELECT or2.has_take_out FROM ordered_reaches or2 WHERE or2.reach_order = rw.end_reach) as end_has_access
+        FROM route_windows rw
+        ORDER BY 
+            (SELECT or1.has_put_in FROM ordered_reaches or1 WHERE or1.reach_order = rw.start_reach)::int +
+            (SELECT or2.has_take_out FROM ordered_reaches or2 WHERE or2.reach_order = rw.end_reach)::int DESC,
+            ABS(rw.total_hours - p_target_hours) ASC
+        LIMIT 1
+    )
+    SELECT 
+        1 as route_id,
+        orp.comid,
+        orp.gnis_name,
+        orp.state,
+        orp.reach_order::INT,
+        orp.length_km,
+        orp.estimated_float_hours,
+        SUM(orp.estimated_float_hours) OVER (ORDER BY orp.reach_order) as cumulative_hours,
+        orp.difficulty_level,
+        orp.has_put_in,
+        orp.has_take_out,
+        orp.aps
+    FROM ordered_reaches orp
+    JOIN best_route br ON orp.reach_order BETWEEN br.start_reach AND br.end_reach
+    ORDER BY orp.reach_order;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- UPDATED EXAMPLE QUERIES
+-- ============================================================================
+/*
+-- Q1: "Tell me about the White River in Vermont" (not Arkansas, not Indiana)
+SELECT * FROM us.river_summary 
+WHERE gnis_name ILIKE '%white river%' AND primary_state = 'VT';
+
+-- Q2: "Find a 2-hour float on the Lamoille in VT"
+SELECT * FROM find_float_route('Lamoille River', 'VT', 2.0);
+
+-- Q3: "What rivers named 'White River' exist?" (disambiguation query)
+SELECT gnis_name, primary_state, total_length_km, max_difficulty_label
+FROM us.river_summary 
+WHERE gnis_name ILIKE '%white river%'
+ORDER BY total_length_km DESC;
+*/
