@@ -3,43 +3,136 @@
 -- ============================================================================
 -- Purpose: Pre-compute river reach metrics, POI associations, and difficulty
 --          scores to optimize LLM queries (reduce joins, save tokens)
+--
+-- DESIGN:
+--   - river_summary: One row per RIVER (aggregated by gnis_name)
+--   - river_reach_profiles: One row per REACH (by comid)
+--   - Access points are linked to specific reaches for routing
+--   - Hydroseq enables ordering reaches upstream→downstream
 -- 
 -- Run order:
 --   1. Create tables and functions (this file)
---   2. Run initial population: CALL populate_river_reach_profiles();
+--   2. Run initial population: CALL populate_river_profiles();
 --   3. Schedule refresh jobs (hourly for flow, daily for POIs)
 -- ============================================================================
 
 -- Drop existing objects if rebuilding
+DROP TABLE IF EXISTS us.river_summary CASCADE;
 DROP TABLE IF EXISTS us.river_reach_profiles CASCADE;
 DROP FUNCTION IF EXISTS calculate_difficulty_score CASCADE;
 DROP FUNCTION IF EXISTS parse_rapid_class CASCADE;
 DROP FUNCTION IF EXISTS calculate_paddling_score CASCADE;
 DROP FUNCTION IF EXISTS calculate_beginner_score CASCADE;
+DROP FUNCTION IF EXISTS estimate_float_time_hours CASCADE;
 
 -- ============================================================================
--- MAIN TABLE
+-- RIVER SUMMARY TABLE (One row per named river)
+-- ============================================================================
+-- Use this for high-level queries: "Tell me about the Lamoille River"
+-- ============================================================================
+CREATE TABLE us.river_summary (
+    id SERIAL PRIMARY KEY,
+    gnis_name TEXT NOT NULL,
+    
+    -- Location
+    primary_state TEXT,              -- State with most river length
+    states TEXT[],                   -- All states the river passes through
+    
+    -- Aggregated metrics
+    total_length_km NUMERIC(10,2),
+    reach_count INT,
+    min_stream_order INT,
+    max_stream_order INT,
+    
+    -- Elevation profile
+    min_elev_m NUMERIC(10,2),
+    max_elev_m NUMERIC(10,2),
+    total_drop_m NUMERIC(10,2),
+    avg_gradient_m_per_km NUMERIC(10,4),
+    
+    -- POI totals for entire river
+    total_access_points INT DEFAULT 0,
+    total_campgrounds INT DEFAULT 0,
+    total_dams INT DEFAULT 0,
+    total_rapids INT DEFAULT 0,
+    total_waterfalls INT DEFAULT 0,
+    
+    -- Difficulty (max across all reaches)
+    max_difficulty_score NUMERIC(4,2),
+    max_difficulty_level INT,
+    max_difficulty_label TEXT,
+    avg_difficulty_score NUMERIC(4,2),
+    
+    -- Typical conditions
+    typical_flow_status TEXT,        -- Most common flow status
+    
+    -- Activity scores (averaged)
+    paddling_score NUMERIC(4,2),
+    beginner_friendly_score NUMERIC(4,2),
+    
+    -- Bounding box for map display
+    bbox_min_lat NUMERIC(10,6),
+    bbox_max_lat NUMERIC(10,6),
+    bbox_min_lon NUMERIC(10,6),
+    bbox_max_lon NUMERIC(10,6),
+    
+    -- Search
+    search_text TSVECTOR,
+    
+    -- Metadata
+    created_at TIMESTAMPTZ DEFAULT NOW(),
+    updated_at TIMESTAMPTZ DEFAULT NOW(),
+    
+    UNIQUE(gnis_name)
+);
+
+CREATE INDEX idx_rs_name ON us.river_summary(gnis_name);
+CREATE INDEX idx_rs_state ON us.river_summary(primary_state);
+CREATE INDEX idx_rs_search ON us.river_summary USING gin(search_text);
+CREATE INDEX idx_rs_difficulty ON us.river_summary(max_difficulty_level);
+CREATE INDEX idx_rs_length ON us.river_summary(total_length_km);
+
+-- ============================================================================
+-- RIVER REACH PROFILES TABLE (One row per reach/COMID)
+-- ============================================================================
+-- Use this for routing: "Find a 2-hour section with put-in/take-out"
 -- ============================================================================
 CREATE TABLE us.river_reach_profiles (
     comid BIGINT PRIMARY KEY,
     
     -- ========================================================================
-    -- CORE RIVER INFO (from river_edges)
+    -- RIVER IDENTITY
     -- ========================================================================
-    gnis_name TEXT,
+    gnis_name TEXT,                  -- Links to river_summary
     state TEXT,
     region TEXT,
-    stream_order INT,
-    length_km NUMERIC(10,3),
     
-    -- Elevation & gradient
+    -- ========================================================================
+    -- NETWORK POSITION (for routing/ordering)
+    -- ========================================================================
+    hydroseq BIGINT,                 -- Hydrologic sequence (lower = downstream)
+    from_node BIGINT,
+    to_node BIGINT,
+    stream_order INT,
+    
+    -- ========================================================================
+    -- REACH METRICS
+    -- ========================================================================
+    length_km NUMERIC(10,3),
     min_elev_m NUMERIC(10,2),
     max_elev_m NUMERIC(10,2),
     total_drop_m NUMERIC(10,2),
     gradient_m_per_km NUMERIC(10,4),
     avg_slope NUMERIC(10,6),
     
-    -- Location (centroid for proximity searches)
+    -- ========================================================================
+    -- FLOAT TIME ESTIMATION
+    -- ========================================================================
+    estimated_float_hours NUMERIC(6,2),  -- Based on length + velocity
+    
+    -- ========================================================================
+    -- LOCATION
+    -- ========================================================================
     centroid_lat NUMERIC(10,6),
     centroid_lon NUMERIC(10,6),
     centroid_geom GEOMETRY(Point, 4326),
@@ -49,66 +142,65 @@ CREATE TABLE us.river_reach_profiles (
     -- ========================================================================
     current_velocity_ms NUMERIC(10,4),
     current_flow_cms NUMERIC(12,4),
-    flow_status TEXT,  -- 'very_low', 'low', 'normal', 'high', 'flood'
+    flow_status TEXT,
     flow_updated_at TIMESTAMPTZ,
     
     -- ========================================================================
-    -- HISTORICAL FLOW CONTEXT (from nearest gauge)
+    -- HISTORICAL FLOW CONTEXT
     -- ========================================================================
     gauge_site_no TEXT,
     gauge_name TEXT,
-    gauge_distance_m NUMERIC(10,2),
-    p10 NUMERIC(12,4),  -- 10th percentile (low flow)
-    p25 NUMERIC(12,4),  -- 25th percentile
-    p50 NUMERIC(12,4),  -- Median flow
-    p75 NUMERIC(12,4),  -- 75th percentile
-    p90 NUMERIC(12,4),  -- 90th percentile (high flow)
+    p10 NUMERIC(12,4),
+    p25 NUMERIC(12,4),
+    p50 NUMERIC(12,4),
+    p75 NUMERIC(12,4),
+    p90 NUMERIC(12,4),
     
     -- ========================================================================
-    -- POI COUNTS (for fast filtering)
+    -- POI COUNTS ON THIS REACH
     -- ========================================================================
     access_point_count INT DEFAULT 0,
     campground_count INT DEFAULT 0,
     dam_count INT DEFAULT 0,
     rapid_count INT DEFAULT 0,
     waterfall_count INT DEFAULT 0,
-    portage_count INT DEFAULT 0,
     
     -- ========================================================================
-    -- POI DETAILS (JSONB for flexibility)
+    -- ACCESS POINTS WITH DETAILS
     -- ========================================================================
-    -- Each array contains objects: {name, type, lat, lon, distance_m, ...}
+    -- Stored with position info so LLM can identify put-ins vs take-outs
+    -- [{id, name, type, lat, lon, position: "upstream"|"midstream"|"downstream"}]
     access_points JSONB DEFAULT '[]'::jsonb,
+    
+    -- ========================================================================
+    -- OTHER POI DETAILS
+    -- ========================================================================
     campgrounds JSONB DEFAULT '[]'::jsonb,
     dams JSONB DEFAULT '[]'::jsonb,
     rapids JSONB DEFAULT '[]'::jsonb,
     waterfalls JSONB DEFAULT '[]'::jsonb,
     
     -- ========================================================================
-    -- DIFFICULTY SCORING INPUTS
+    -- DIFFICULTY SCORING
     -- ========================================================================
-    max_rapid_class INT DEFAULT 0,        -- 0-6 (Class I-VI)
-    rapid_density NUMERIC(10,4) DEFAULT 0, -- rapids per km
-    
-    -- ========================================================================
-    -- COMPUTED SCORES
-    -- ========================================================================
-    -- Difficulty (1.00 - 5.00)
+    max_rapid_class INT DEFAULT 0,
+    rapid_density NUMERIC(10,4) DEFAULT 0,
     difficulty_score NUMERIC(4,2),
-    difficulty_level INT,              -- 1-5 rounded
-    difficulty_label TEXT,             -- 'Flatwater', 'Easy', 'Moderate', 'Difficult', 'Expert'
-    difficulty_factors JSONB,          -- Breakdown of scoring factors
+    difficulty_level INT,
+    difficulty_label TEXT,
+    difficulty_factors JSONB,
     
-    -- Activity scores (1.00 - 5.00, higher = better for activity)
+    -- ========================================================================
+    -- ACTIVITY SCORES
+    -- ========================================================================
     paddling_score NUMERIC(4,2),
-    fishing_score NUMERIC(4,2),
-    scenery_score NUMERIC(4,2),
     beginner_friendly_score NUMERIC(4,2),
     
     -- ========================================================================
-    -- SEARCH OPTIMIZATION
+    -- FLAGS
     -- ========================================================================
-    search_text TSVECTOR,              -- Full-text search index
+    has_put_in BOOLEAN DEFAULT FALSE,   -- Has usable access point for starting
+    has_take_out BOOLEAN DEFAULT FALSE, -- Has usable access point for ending
     
     -- ========================================================================
     -- METADATA
@@ -119,18 +211,17 @@ CREATE TABLE us.river_reach_profiles (
     difficulty_updated_at TIMESTAMPTZ
 );
 
--- ============================================================================
--- INDEXES
--- ============================================================================
-CREATE INDEX idx_rrp_name_search ON us.river_reach_profiles USING gin(search_text);
+-- Indexes
+CREATE INDEX idx_rrp_gnis ON us.river_reach_profiles(gnis_name);
 CREATE INDEX idx_rrp_state ON us.river_reach_profiles(state);
+CREATE INDEX idx_rrp_hydroseq ON us.river_reach_profiles(gnis_name, hydroseq);
 CREATE INDEX idx_rrp_stream_order ON us.river_reach_profiles(stream_order);
 CREATE INDEX idx_rrp_difficulty ON us.river_reach_profiles(difficulty_level);
-CREATE INDEX idx_rrp_paddling ON us.river_reach_profiles(paddling_score DESC NULLS LAST);
-CREATE INDEX idx_rrp_beginner ON us.river_reach_profiles(beginner_friendly_score DESC NULLS LAST);
 CREATE INDEX idx_rrp_location ON us.river_reach_profiles USING gist(centroid_geom);
 CREATE INDEX idx_rrp_flow_status ON us.river_reach_profiles(flow_status);
-CREATE INDEX idx_rrp_access_count ON us.river_reach_profiles(access_point_count) WHERE access_point_count > 0;
+CREATE INDEX idx_rrp_has_access ON us.river_reach_profiles(gnis_name) 
+    WHERE has_put_in = TRUE OR has_take_out = TRUE;
+CREATE INDEX idx_rrp_float_time ON us.river_reach_profiles(estimated_float_hours);
 
 -- ============================================================================
 -- HELPER FUNCTIONS
@@ -160,22 +251,27 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
+-- Estimate float time based on length and velocity
+-- Default velocity: 3 km/h (typical lazy river float)
+CREATE OR REPLACE FUNCTION estimate_float_time_hours(
+    p_length_km NUMERIC,
+    p_velocity_ms NUMERIC
+) RETURNS NUMERIC AS $$
+DECLARE
+    v_velocity_kmh NUMERIC;
+BEGIN
+    -- Convert m/s to km/h, use default if no velocity data
+    v_velocity_kmh := COALESCE(p_velocity_ms * 3.6, 3.0);
+    
+    -- Minimum velocity to avoid division issues
+    v_velocity_kmh := GREATEST(v_velocity_kmh, 1.0);
+    
+    RETURN ROUND(COALESCE(p_length_km, 0) / v_velocity_kmh, 2);
+END;
+$$ LANGUAGE plpgsql IMMUTABLE;
+
 -- ============================================================================
 -- DIFFICULTY SCORING FUNCTION
--- ============================================================================
--- Weights calibrated to American Whitewater International Scale:
---   Class I:  Easy - Fast moving water with riffles and small waves
---   Class II: Novice - Straightforward rapids with wide, clear channels
---   Class III: Intermediate - Rapids with moderate, irregular waves
---   Class IV: Advanced - Intense, powerful rapids requiring precise handling
---   Class V:  Expert - Extremely long, obstructed, or very violent rapids
---   Class VI: Extreme - Nearly impossible, very dangerous
---
--- Weight justification (based on whitewater safety literature):
---   - Rapid class is primary indicator (40%) - direct correlation to skill needed
---   - Hazards critical for safety (25%) - waterfalls/dams are binary dangers
---   - Gradient indicates water speed (20%) - steeper = faster = harder
---   - Rapid density for sustained difficulty (15%) - pool-drop vs continuous
 -- ============================================================================
 CREATE OR REPLACE FUNCTION calculate_difficulty_score(
     p_max_rapid_class INT,
@@ -186,7 +282,6 @@ CREATE OR REPLACE FUNCTION calculate_difficulty_score(
     p_total_drop_m NUMERIC
 ) RETURNS JSONB AS $$
 DECLARE
-    -- Weight configuration (tune these based on real-world validation)
     W_RAPID_CLASS CONSTANT NUMERIC := 0.40;
     W_HAZARDS CONSTANT NUMERIC := 0.25;
     W_GRADIENT CONSTANT NUMERIC := 0.20;
@@ -200,41 +295,24 @@ DECLARE
     v_level INT;
     v_label TEXT;
 BEGIN
-    -- 1. RAPID CLASS SCORE (0-5)
-    -- Maps International Scale to our 1-5 difficulty
     v_rapid_score := CASE COALESCE(p_max_rapid_class, 0)
-        WHEN 0 THEN 1.0    -- No rapids = flatwater
-        WHEN 1 THEN 1.8    -- Class I
-        WHEN 2 THEN 2.6    -- Class II
-        WHEN 3 THEN 3.5    -- Class III
-        WHEN 4 THEN 4.3    -- Class IV
-        WHEN 5 THEN 4.8    -- Class V
-        ELSE 5.0           -- Class VI
+        WHEN 0 THEN 1.0
+        WHEN 1 THEN 1.8
+        WHEN 2 THEN 2.6
+        WHEN 3 THEN 3.5
+        WHEN 4 THEN 4.3
+        WHEN 5 THEN 4.8
+        ELSE 5.0
     END;
     
-    -- 2. RAPID DENSITY SCORE
-    -- 0/km = 1.0, 0.5/km = 2.0, 1.0/km = 3.0, 2.0/km = 4.0, 3+/km = 5.0
     v_density_score := LEAST(5.0, GREATEST(1.0, 
         1.0 + (COALESCE(p_rapid_density, 0) * 1.33)
     ));
     
-    -- 3. HAZARD SCORE (waterfalls & dams)
-    -- Each waterfall: +1.5 (often unrunnable)
-    -- Each dam: +1.0 (portage required, hydraulic danger)
-    -- Minimum 1.0, capped at 5.0
     v_hazard_score := LEAST(5.0, GREATEST(1.0,
-        1.0 + 
-        (COALESCE(p_waterfall_count, 0) * 1.5) + 
-        (COALESCE(p_dam_count, 0) * 1.0)
+        1.0 + (COALESCE(p_waterfall_count, 0) * 1.5) + (COALESCE(p_dam_count, 0) * 1.0)
     ));
     
-    -- 4. GRADIENT SCORE
-    -- Based on standard whitewater gradient classifications:
-    --   < 1 m/km:  Flatwater (1.0)
-    --   1-5 m/km:  Easy (2.0)
-    --   5-15 m/km: Moderate (3.0)
-    --   15-30 m/km: Steep (4.0)
-    --   > 30 m/km: Very Steep (5.0)
     v_gradient_score := CASE
         WHEN COALESCE(p_gradient_m_per_km, 0) < 1 THEN 1.0
         WHEN p_gradient_m_per_km < 5 THEN 1.5 + (p_gradient_m_per_km / 10)
@@ -243,7 +321,6 @@ BEGIN
         ELSE 5.0
     END;
     
-    -- WEIGHTED FINAL SCORE
     v_final_score := (
         (v_rapid_score * W_RAPID_CLASS) +
         (v_density_score * W_DENSITY) +
@@ -251,13 +328,9 @@ BEGIN
         (v_gradient_score * W_GRADIENT)
     );
     
-    -- Ensure bounds [1.0, 5.0]
     v_final_score := GREATEST(1.0, LEAST(5.0, v_final_score));
-    
-    -- Round to level (1-5)
     v_level := ROUND(v_final_score)::INT;
     
-    -- Human-readable label
     v_label := CASE v_level
         WHEN 1 THEN 'Flatwater'
         WHEN 2 THEN 'Easy'
@@ -271,27 +344,10 @@ BEGIN
         'level', v_level,
         'label', v_label,
         'factors', jsonb_build_object(
-            'rapid_class', jsonb_build_object(
-                'input', p_max_rapid_class, 
-                'score', ROUND(v_rapid_score, 2), 
-                'weight', W_RAPID_CLASS
-            ),
-            'rapid_density', jsonb_build_object(
-                'input', ROUND(COALESCE(p_rapid_density, 0), 2), 
-                'score', ROUND(v_density_score, 2), 
-                'weight', W_DENSITY
-            ),
-            'hazards', jsonb_build_object(
-                'waterfalls', COALESCE(p_waterfall_count, 0), 
-                'dams', COALESCE(p_dam_count, 0), 
-                'score', ROUND(v_hazard_score, 2), 
-                'weight', W_HAZARDS
-            ),
-            'gradient', jsonb_build_object(
-                'input_m_per_km', ROUND(COALESCE(p_gradient_m_per_km, 0), 2), 
-                'score', ROUND(v_gradient_score, 2), 
-                'weight', W_GRADIENT
-            )
+            'rapid_class', jsonb_build_object('input', p_max_rapid_class, 'score', ROUND(v_rapid_score, 2), 'weight', W_RAPID_CLASS),
+            'rapid_density', jsonb_build_object('input', ROUND(COALESCE(p_rapid_density, 0), 2), 'score', ROUND(v_density_score, 2), 'weight', W_DENSITY),
+            'hazards', jsonb_build_object('waterfalls', COALESCE(p_waterfall_count, 0), 'dams', COALESCE(p_dam_count, 0), 'score', ROUND(v_hazard_score, 2), 'weight', W_HAZARDS),
+            'gradient', jsonb_build_object('input_m_per_km', ROUND(COALESCE(p_gradient_m_per_km, 0), 2), 'score', ROUND(v_gradient_score, 2), 'weight', W_GRADIENT)
         ),
         'weights_version', '1.0'
     );
@@ -302,7 +358,6 @@ $$ LANGUAGE plpgsql IMMUTABLE;
 -- ACTIVITY SCORING FUNCTIONS
 -- ============================================================================
 
--- Paddling score: Higher = better for paddling
 CREATE OR REPLACE FUNCTION calculate_paddling_score(
     p_access_count INT,
     p_difficulty_level INT,
@@ -311,9 +366,8 @@ CREATE OR REPLACE FUNCTION calculate_paddling_score(
     p_campground_count INT
 ) RETURNS NUMERIC AS $$
 DECLARE
-    v_score NUMERIC := 2.5;  -- Start at middle
+    v_score NUMERIC := 2.5;
 BEGIN
-    -- Access points: Need at least 2 for a proper run
     IF COALESCE(p_access_count, 0) >= 2 THEN
         v_score := v_score + 1.0;
     ELSIF p_access_count = 1 THEN
@@ -322,7 +376,6 @@ BEGIN
         v_score := v_score - 1.0;
     END IF;
     
-    -- Flow status: Normal/high is best
     v_score := v_score + CASE COALESCE(p_flow_status, 'unknown')
         WHEN 'normal' THEN 0.5
         WHEN 'high' THEN 0.3
@@ -332,14 +385,12 @@ BEGIN
         ELSE 0
     END;
     
-    -- Length: 5-20km is ideal day trip
     IF COALESCE(p_length_km, 0) BETWEEN 5 AND 20 THEN
         v_score := v_score + 0.5;
     ELSIF p_length_km BETWEEN 2 AND 30 THEN
         v_score := v_score + 0.2;
     END IF;
     
-    -- Camping nearby: Bonus for multi-day options
     IF COALESCE(p_campground_count, 0) > 0 THEN
         v_score := v_score + 0.3;
     END IF;
@@ -348,7 +399,6 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
--- Beginner-friendly score: Higher = more suitable for beginners
 CREATE OR REPLACE FUNCTION calculate_beginner_score(
     p_difficulty_level INT,
     p_access_count INT,
@@ -357,7 +407,6 @@ CREATE OR REPLACE FUNCTION calculate_beginner_score(
 DECLARE
     v_score NUMERIC := 3.0;
 BEGIN
-    -- Difficulty: Lower is better for beginners
     v_score := v_score + CASE COALESCE(p_difficulty_level, 3)
         WHEN 1 THEN 1.5
         WHEN 2 THEN 0.8
@@ -366,12 +415,10 @@ BEGIN
         ELSE -2.0
     END;
     
-    -- Good access is important for beginners
     IF COALESCE(p_access_count, 0) >= 2 THEN
         v_score := v_score + 0.5;
     END IF;
     
-    -- Stable flow conditions
     IF COALESCE(p_flow_status, '') IN ('normal', 'low') THEN
         v_score := v_score + 0.3;
     ELSIF p_flow_status IN ('high', 'flood') THEN
@@ -383,11 +430,97 @@ END;
 $$ LANGUAGE plpgsql IMMUTABLE;
 
 -- ============================================================================
--- POPULATION PROCEDURE
+-- ROUTE FINDING FUNCTION
 -- ============================================================================
--- Call this to initially populate or fully rebuild the profiles table
+-- Find a contiguous route on a river with target float time
+-- Returns reaches in order with cumulative stats
 -- ============================================================================
-CREATE OR REPLACE PROCEDURE populate_river_reach_profiles()
+CREATE OR REPLACE FUNCTION find_float_route(
+    p_river_name TEXT,
+    p_target_hours NUMERIC,
+    p_tolerance_hours NUMERIC DEFAULT 0.5,
+    p_max_difficulty INT DEFAULT 5
+) RETURNS TABLE (
+    route_id INT,
+    comid BIGINT,
+    gnis_name TEXT,
+    reach_order INT,
+    length_km NUMERIC,
+    float_hours NUMERIC,
+    cumulative_hours NUMERIC,
+    difficulty_level INT,
+    has_put_in BOOLEAN,
+    has_take_out BOOLEAN,
+    access_points JSONB
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH ordered_reaches AS (
+        SELECT 
+            rrp.comid,
+            rrp.gnis_name,
+            ROW_NUMBER() OVER (ORDER BY rrp.hydroseq DESC) as reach_order,
+            rrp.length_km,
+            rrp.estimated_float_hours,
+            rrp.difficulty_level,
+            rrp.has_put_in,
+            rrp.has_take_out,
+            rrp.access_points as aps
+        FROM us.river_reach_profiles rrp
+        WHERE rrp.gnis_name ILIKE p_river_name
+          AND COALESCE(rrp.difficulty_level, 1) <= p_max_difficulty
+        ORDER BY rrp.hydroseq DESC
+    ),
+    route_windows AS (
+        SELECT 
+            r1.reach_order as start_reach,
+            r2.reach_order as end_reach,
+            SUM(r3.estimated_float_hours) as total_hours,
+            SUM(r3.length_km) as total_km
+        FROM ordered_reaches r1
+        CROSS JOIN ordered_reaches r2
+        JOIN ordered_reaches r3 
+            ON r3.reach_order BETWEEN r1.reach_order AND r2.reach_order
+        WHERE r2.reach_order >= r1.reach_order
+        GROUP BY r1.reach_order, r2.reach_order
+        HAVING SUM(r3.estimated_float_hours) BETWEEN (p_target_hours - p_tolerance_hours) 
+                                                  AND (p_target_hours + p_tolerance_hours)
+    ),
+    best_route AS (
+        SELECT 
+            rw.*,
+            -- Prefer routes with put-in at start and take-out at end
+            (SELECT has_put_in FROM ordered_reaches WHERE reach_order = rw.start_reach) as start_has_access,
+            (SELECT has_take_out FROM ordered_reaches WHERE reach_order = rw.end_reach) as end_has_access
+        FROM route_windows rw
+        ORDER BY 
+            (SELECT has_put_in FROM ordered_reaches WHERE reach_order = rw.start_reach)::int +
+            (SELECT has_take_out FROM ordered_reaches WHERE reach_order = rw.end_reach)::int DESC,
+            ABS(rw.total_hours - p_target_hours) ASC
+        LIMIT 1
+    )
+    SELECT 
+        1 as route_id,
+        orp.comid,
+        orp.gnis_name,
+        orp.reach_order::INT,
+        orp.length_km,
+        orp.estimated_float_hours,
+        SUM(orp.estimated_float_hours) OVER (ORDER BY orp.reach_order) as cumulative_hours,
+        orp.difficulty_level,
+        orp.has_put_in,
+        orp.has_take_out,
+        orp.aps
+    FROM ordered_reaches orp
+    JOIN best_route br ON orp.reach_order BETWEEN br.start_reach AND br.end_reach
+    ORDER BY orp.reach_order;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- MAIN POPULATION PROCEDURE
+-- ============================================================================
+CREATE OR REPLACE PROCEDURE populate_river_profiles()
 LANGUAGE plpgsql
 AS $$
 DECLARE
@@ -395,16 +528,17 @@ DECLARE
     v_count INT;
 BEGIN
     v_start_time := NOW();
-    RAISE NOTICE 'Starting river reach profiles population at %', v_start_time;
+    RAISE NOTICE 'Starting river profiles population at %', v_start_time;
     
     -- ========================================================================
-    -- STEP 1: Insert base river data
+    -- STEP 1: Populate reach profiles
     -- ========================================================================
-    RAISE NOTICE 'Step 1: Inserting base river data...';
+    RAISE NOTICE 'Step 1: Inserting reach data...';
     
     INSERT INTO us.river_reach_profiles (
-        comid, gnis_name, state, region, stream_order, length_km,
-        min_elev_m, max_elev_m, total_drop_m, gradient_m_per_km, avg_slope,
+        comid, gnis_name, state, region, stream_order,
+        hydroseq, from_node, to_node,
+        length_km, min_elev_m, max_elev_m, total_drop_m, gradient_m_per_km, avg_slope,
         centroid_lat, centroid_lon, centroid_geom
     )
     SELECT 
@@ -413,6 +547,9 @@ BEGIN
         COALESCE(s.stusps, r.region) as state,
         r.region,
         r.stream_order,
+        r.hydroseq,
+        r.from_node,
+        r.to_node,
         r.lengthkm,
         r.min_elev_m,
         r.max_elev_m,
@@ -427,15 +564,13 @@ BEGIN
     FROM public.river_edges r
     LEFT JOIN us.states s ON ST_Intersects(ST_Centroid(r.geom), s.geom)
     WHERE r.gnis_name IS NOT NULL
-      AND r.stream_order >= 2  -- Skip tiny tributaries
+      AND r.stream_order >= 2
     ON CONFLICT (comid) DO UPDATE SET
         gnis_name = EXCLUDED.gnis_name,
         state = EXCLUDED.state,
+        hydroseq = EXCLUDED.hydroseq,
         stream_order = EXCLUDED.stream_order,
         length_km = EXCLUDED.length_km,
-        min_elev_m = EXCLUDED.min_elev_m,
-        max_elev_m = EXCLUDED.max_elev_m,
-        total_drop_m = EXCLUDED.total_drop_m,
         gradient_m_per_km = EXCLUDED.gradient_m_per_km,
         profile_updated_at = NOW();
     
@@ -443,64 +578,61 @@ BEGIN
     RAISE NOTICE 'Inserted/updated % river reaches', v_count;
     
     -- ========================================================================
-    -- STEP 2: Aggregate POI counts and details
+    -- STEP 2: Link POIs to reaches
     -- ========================================================================
-    RAISE NOTICE 'Step 2: Aggregating POIs...';
+    RAISE NOTICE 'Step 2: Linking POIs...';
     CALL refresh_poi_associations();
     
     -- ========================================================================
-    -- STEP 3: Link gauges and flow percentiles
+    -- STEP 3: Link gauges
     -- ========================================================================
     RAISE NOTICE 'Step 3: Linking gauges...';
     CALL refresh_gauge_associations();
     
     -- ========================================================================
-    -- STEP 4: Update flow data from NWM
+    -- STEP 4: Update flow data
     -- ========================================================================
     RAISE NOTICE 'Step 4: Updating flow data...';
     CALL refresh_flow_data();
     
     -- ========================================================================
-    -- STEP 5: Calculate difficulty scores
+    -- STEP 5: Calculate difficulty
     -- ========================================================================
-    RAISE NOTICE 'Step 5: Calculating difficulty scores...';
+    RAISE NOTICE 'Step 5: Calculating difficulty...';
     CALL refresh_difficulty_scores();
     
     -- ========================================================================
-    -- STEP 6: Calculate activity scores
+    -- STEP 6: Calculate float times and activity scores
     -- ========================================================================
-    RAISE NOTICE 'Step 6: Calculating activity scores...';
+    RAISE NOTICE 'Step 6: Calculating float times and scores...';
     CALL refresh_activity_scores();
     
     -- ========================================================================
-    -- STEP 7: Build search index
+    -- STEP 7: Build river summary
     -- ========================================================================
-    RAISE NOTICE 'Step 7: Building search index...';
-    UPDATE us.river_reach_profiles
-    SET search_text = to_tsvector('english', 
-        COALESCE(gnis_name, '') || ' ' ||
-        COALESCE(state, '') || ' ' ||
-        COALESCE(difficulty_label, '')
-    );
+    RAISE NOTICE 'Step 7: Building river summary...';
+    CALL refresh_river_summary();
     
     RAISE NOTICE 'Population complete in %', NOW() - v_start_time;
 END;
 $$;
 
 -- ============================================================================
--- REFRESH PROCEDURES (for scheduled jobs)
+-- REFRESH PROCEDURES
 -- ============================================================================
 
--- Refresh POI associations (run daily)
+-- Refresh POI associations with reach linkage
 CREATE OR REPLACE PROCEDURE refresh_poi_associations()
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- Access points (within 2km of river centroid)
+    -- Access points - link to nearest reach and determine position
     UPDATE us.river_reach_profiles rp
     SET 
         access_point_count = sub.cnt,
         access_points = sub.details,
+        has_put_in = sub.cnt > 0,
+        has_take_out = sub.cnt > 0,
         pois_updated_at = NOW()
     FROM (
         SELECT 
@@ -511,19 +643,20 @@ BEGIN
                 'name', a.name,
                 'type', a.access_type,
                 'lat', a.lat,
-                'lon', a.lon
+                'lon', a.lon,
+                'source', a.source
             ) ORDER BY a.name) FILTER (WHERE a.id IS NOT NULL), '[]'::jsonb) as details
         FROM us.river_reach_profiles r
         LEFT JOIN us.access_points a ON ST_DWithin(
             r.centroid_geom::geography,
             a.geom::geography,
-            2000  -- 2km radius
+            1000  -- 1km - tighter radius for better accuracy
         )
         GROUP BY r.comid
     ) sub
     WHERE rp.comid = sub.comid;
     
-    -- Campgrounds (within 5km)
+    -- Campgrounds
     UPDATE us.river_reach_profiles rp
     SET campground_count = sub.cnt, campgrounds = sub.details
     FROM (
@@ -548,7 +681,7 @@ BEGIN
     ) sub
     WHERE rp.comid = sub.comid;
     
-    -- Dams (linked by nearest_comid)
+    -- Dams
     UPDATE us.river_reach_profiles rp
     SET dam_count = sub.cnt, dams = sub.details
     FROM (
@@ -569,7 +702,7 @@ BEGIN
     ) sub
     WHERE rp.comid = sub.comid;
     
-    -- Rapids (linked by nearest_comid)
+    -- Rapids
     UPDATE us.river_reach_profiles rp
     SET rapid_count = sub.cnt, rapids = sub.details
     FROM (
@@ -589,7 +722,7 @@ BEGIN
     ) sub
     WHERE rp.comid = sub.comid;
     
-    -- Waterfalls (linked by nearest_comid)
+    -- Waterfalls
     UPDATE us.river_reach_profiles rp
     SET waterfall_count = sub.cnt, waterfalls = sub.details
     FROM (
@@ -613,7 +746,7 @@ BEGIN
 END;
 $$;
 
--- Refresh gauge associations (run daily)
+-- Refresh gauge associations
 CREATE OR REPLACE PROCEDURE refresh_gauge_associations()
 LANGUAGE plpgsql
 AS $$
@@ -660,12 +793,11 @@ BEGIN
 END;
 $$;
 
--- Refresh difficulty scores (run daily or after POI updates)
+-- Refresh difficulty scores
 CREATE OR REPLACE PROCEDURE refresh_difficulty_scores()
 LANGUAGE plpgsql
 AS $$
 BEGIN
-    -- First calculate max rapid class per reach
     UPDATE us.river_reach_profiles rp
     SET max_rapid_class = COALESCE(
         (SELECT MAX(parse_rapid_class(r.rapid_class))
@@ -677,20 +809,13 @@ BEGIN
         ELSE 0 
     END;
     
-    -- Then calculate full difficulty score
     UPDATE us.river_reach_profiles rp
-    SET 
-        difficulty_factors = calculate_difficulty_score(
-            rp.max_rapid_class,
-            rp.rapid_density,
-            rp.waterfall_count,
-            rp.dam_count,
-            rp.gradient_m_per_km,
-            rp.total_drop_m
+    SET difficulty_factors = calculate_difficulty_score(
+            rp.max_rapid_class, rp.rapid_density, rp.waterfall_count,
+            rp.dam_count, rp.gradient_m_per_km, rp.total_drop_m
         ),
         difficulty_updated_at = NOW();
     
-    -- Extract score components
     UPDATE us.river_reach_profiles
     SET 
         difficulty_score = (difficulty_factors->>'score')::NUMERIC,
@@ -701,27 +826,76 @@ BEGIN
 END;
 $$;
 
--- Refresh activity scores (run after difficulty/flow updates)
+-- Refresh activity scores and float times
 CREATE OR REPLACE PROCEDURE refresh_activity_scores()
 LANGUAGE plpgsql
 AS $$
 BEGIN
     UPDATE us.river_reach_profiles
     SET 
+        estimated_float_hours = estimate_float_time_hours(length_km, current_velocity_ms),
         paddling_score = calculate_paddling_score(
-            access_point_count,
-            difficulty_level,
-            flow_status,
-            length_km,
-            campground_count
+            access_point_count, difficulty_level, flow_status, length_km, campground_count
         ),
         beginner_friendly_score = calculate_beginner_score(
-            difficulty_level,
-            access_point_count,
-            flow_status
+            difficulty_level, access_point_count, flow_status
         );
     
     RAISE NOTICE 'Activity scores refreshed';
+END;
+$$;
+
+-- Build/refresh river summary table
+CREATE OR REPLACE PROCEDURE refresh_river_summary()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    -- Clear and rebuild
+    TRUNCATE us.river_summary;
+    
+    INSERT INTO us.river_summary (
+        gnis_name, primary_state, states,
+        total_length_km, reach_count, min_stream_order, max_stream_order,
+        min_elev_m, max_elev_m, total_drop_m, avg_gradient_m_per_km,
+        total_access_points, total_campgrounds, total_dams, total_rapids, total_waterfalls,
+        max_difficulty_score, max_difficulty_level, max_difficulty_label, avg_difficulty_score,
+        paddling_score, beginner_friendly_score,
+        bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon,
+        search_text
+    )
+    SELECT 
+        gnis_name,
+        MODE() WITHIN GROUP (ORDER BY state) as primary_state,
+        ARRAY_AGG(DISTINCT state) FILTER (WHERE state IS NOT NULL) as states,
+        SUM(length_km) as total_length_km,
+        COUNT(*) as reach_count,
+        MIN(stream_order) as min_stream_order,
+        MAX(stream_order) as max_stream_order,
+        MIN(min_elev_m) as min_elev_m,
+        MAX(max_elev_m) as max_elev_m,
+        MAX(max_elev_m) - MIN(min_elev_m) as total_drop_m,
+        AVG(gradient_m_per_km) as avg_gradient_m_per_km,
+        SUM(access_point_count) as total_access_points,
+        SUM(campground_count) as total_campgrounds,
+        SUM(dam_count) as total_dams,
+        SUM(rapid_count) as total_rapids,
+        SUM(waterfall_count) as total_waterfalls,
+        MAX(difficulty_score) as max_difficulty_score,
+        MAX(difficulty_level) as max_difficulty_level,
+        MAX(difficulty_label) as max_difficulty_label,
+        AVG(difficulty_score) as avg_difficulty_score,
+        AVG(paddling_score) as paddling_score,
+        AVG(beginner_friendly_score) as beginner_friendly_score,
+        MIN(centroid_lat) as bbox_min_lat,
+        MAX(centroid_lat) as bbox_max_lat,
+        MIN(centroid_lon) as bbox_min_lon,
+        MAX(centroid_lon) as bbox_max_lon,
+        to_tsvector('english', gnis_name || ' ' || COALESCE(MODE() WITHIN GROUP (ORDER BY state), ''))
+    FROM us.river_reach_profiles
+    WHERE gnis_name IS NOT NULL
+    GROUP BY gnis_name;
+    
+    RAISE NOTICE 'River summary refreshed';
 END;
 $$;
 
@@ -729,57 +903,53 @@ $$;
 -- EXAMPLE QUERIES FOR LLM
 -- ============================================================================
 /*
--- Find beginner-friendly rivers in Vermont with good access
+-- Q1: "Tell me about the Lamoille River"
 SELECT 
-    gnis_name,
-    difficulty_label,
-    difficulty_score,
-    flow_status,
-    access_point_count,
-    beginner_friendly_score
-FROM us.river_reach_profiles
-WHERE state = 'VT'
-  AND difficulty_level <= 2
-  AND access_point_count >= 2
-ORDER BY beginner_friendly_score DESC
-LIMIT 10;
+    gnis_name, primary_state, states,
+    total_length_km, reach_count,
+    total_access_points, total_rapids, total_dams,
+    max_difficulty_label, avg_difficulty_score,
+    paddling_score
+FROM us.river_summary
+WHERE gnis_name ILIKE '%lamoille%';
 
--- Find challenging whitewater with rapids
-SELECT 
-    gnis_name,
-    difficulty_label,
-    difficulty_factors,
-    max_rapid_class,
-    rapid_count,
-    current_flow_cms,
-    flow_status
-FROM us.river_reach_profiles
-WHERE difficulty_level >= 4
-  AND rapid_count > 0
-  AND flow_status = 'normal'
-ORDER BY difficulty_score DESC
-LIMIT 10;
+-- Q2: "Find a 2-hour float on the Lamoille with put-in and take-out"
+SELECT * FROM find_float_route('Lamoille River', 2.0, 0.5);
 
--- Search by name with full context
+-- Q3: "What are the access points on the White River?"
 SELECT 
-    gnis_name, state,
-    difficulty_label,
-    current_flow_cms, flow_status,
-    access_points, campgrounds, rapids, dams
-FROM us.river_reach_profiles
-WHERE search_text @@ to_tsquery('white & river')
-ORDER BY paddling_score DESC
-LIMIT 5;
+    rp.gnis_name,
+    rp.hydroseq,
+    rp.access_points,
+    rp.estimated_float_hours
+FROM us.river_reach_profiles rp
+WHERE rp.gnis_name ILIKE '%white river%'
+  AND rp.access_point_count > 0
+ORDER BY rp.hydroseq DESC;
+
+-- Q4: "Find easy rivers near Burlington, VT for beginners"
+SELECT 
+    rs.gnis_name,
+    rs.total_length_km,
+    rs.max_difficulty_label,
+    rs.total_access_points,
+    rs.beginner_friendly_score
+FROM us.river_summary rs
+WHERE rs.primary_state = 'VT'
+  AND rs.max_difficulty_level <= 2
+  AND rs.total_access_points >= 2
+ORDER BY rs.beginner_friendly_score DESC
+LIMIT 10;
 */
 
 -- ============================================================================
 -- COMMENTS
 -- ============================================================================
+COMMENT ON TABLE us.river_summary IS 
+'Aggregated river-level metrics. One row per named river. Use for high-level queries.';
+
 COMMENT ON TABLE us.river_reach_profiles IS 
-'Denormalized river reach metrics for LLM chatbot optimization. Pre-computes POI associations, difficulty scores, and flow context to minimize query complexity and token usage.';
+'Per-reach metrics with POI details. Use hydroseq for ordering. Use for routing queries.';
 
-COMMENT ON COLUMN us.river_reach_profiles.difficulty_score IS 
-'Composite difficulty rating 1.0-5.0 based on rapids, hazards, and gradient. See difficulty_factors for breakdown.';
-
-COMMENT ON COLUMN us.river_reach_profiles.difficulty_factors IS 
-'JSONB breakdown of difficulty scoring factors with weights for transparency and tuning.';
+COMMENT ON FUNCTION find_float_route IS
+'Find a contiguous route on a river matching target float time. Returns ordered reaches with access point info.';
