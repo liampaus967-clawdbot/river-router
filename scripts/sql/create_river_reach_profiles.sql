@@ -1081,3 +1081,358 @@ FROM us.river_summary
 WHERE gnis_name ILIKE '%white river%'
 ORDER BY total_length_km DESC;
 */
+
+-- ============================================================================
+-- DISSOLVED RIVER IDENTIFICATION
+-- ============================================================================
+-- Assigns unique river_id to each physically distinct river
+-- Rivers with same name but disconnected networks get different IDs
+-- e.g., Connecticut River (4 states, connected) = 1 ID
+--       Birch Creek MT vs Birch Creek VT (disconnected) = 2 IDs
+-- ============================================================================
+
+-- Add river_id to reach profiles
+ALTER TABLE us.river_reach_profiles 
+    ADD COLUMN IF NOT EXISTS river_id INT;
+
+-- Add river_id to summary (will now be truly unique per physical river)
+ALTER TABLE us.river_summary
+    ADD COLUMN IF NOT EXISTS river_id INT;
+
+-- Drop old constraints that assumed name+state uniqueness
+ALTER TABLE us.river_summary 
+    DROP CONSTRAINT IF EXISTS river_summary_name_state_unique;
+ALTER TABLE us.river_summary 
+    DROP CONSTRAINT IF EXISTS river_summary_gnis_name_key;
+
+-- ============================================================================
+-- FUNCTION: Assign river IDs based on network connectivity
+-- ============================================================================
+-- Uses connected components algorithm via recursive CTE
+-- Reaches with same gnis_name that are connected = same river_id
+-- ============================================================================
+CREATE OR REPLACE PROCEDURE assign_river_ids()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_river_id INT := 0;
+    v_river_name TEXT;
+    v_seed_comid BIGINT;
+    v_count INT;
+BEGIN
+    RAISE NOTICE 'Assigning river IDs based on network connectivity...';
+    
+    -- Reset all river_ids
+    UPDATE us.river_reach_profiles SET river_id = NULL;
+    
+    -- Process each unique river name
+    FOR v_river_name IN 
+        SELECT DISTINCT gnis_name 
+        FROM us.river_reach_profiles 
+        WHERE gnis_name IS NOT NULL
+        ORDER BY gnis_name
+    LOOP
+        -- Find all unassigned reaches for this river name
+        -- and group them by connectivity
+        LOOP
+            -- Find a seed reach that hasn't been assigned yet
+            SELECT comid INTO v_seed_comid
+            FROM us.river_reach_profiles
+            WHERE gnis_name = v_river_name
+              AND river_id IS NULL
+            LIMIT 1;
+            
+            -- Exit if no more unassigned reaches for this name
+            EXIT WHEN v_seed_comid IS NULL;
+            
+            -- Increment river_id for this new connected component
+            v_river_id := v_river_id + 1;
+            
+            -- Find all reaches connected to the seed (same name, connected network)
+            WITH RECURSIVE connected AS (
+                -- Start with the seed reach
+                SELECT comid, from_node, to_node
+                FROM public.river_edges
+                WHERE comid = v_seed_comid
+                
+                UNION
+                
+                -- Add reaches that connect upstream or downstream
+                SELECT e.comid, e.from_node, e.to_node
+                FROM public.river_edges e
+                JOIN connected c ON (
+                    e.from_node = c.to_node OR   -- e flows into c
+                    e.to_node = c.from_node      -- c flows into e
+                )
+                WHERE e.gnis_name = v_river_name
+                  AND e.comid NOT IN (SELECT comid FROM connected)
+            )
+            UPDATE us.river_reach_profiles rp
+            SET river_id = v_river_id
+            FROM connected c
+            WHERE rp.comid = c.comid
+              AND rp.gnis_name = v_river_name;
+            
+            GET DIAGNOSTICS v_count = ROW_COUNT;
+            
+            IF v_count > 0 THEN
+                RAISE NOTICE 'River ID %: % (%  reaches)', v_river_id, v_river_name, v_count;
+            END IF;
+        END LOOP;
+    END LOOP;
+    
+    RAISE NOTICE 'Assigned % unique river IDs', v_river_id;
+END;
+$$;
+
+-- ============================================================================
+-- SIMPLER ALTERNATIVE: Using HUC watershed codes
+-- ============================================================================
+-- If the recursive approach is too slow, use HUC codes as a proxy:
+-- Same name + same HUC4 (or HUC6) = same river
+-- This is faster but slightly less accurate for rivers crossing HUC boundaries
+-- ============================================================================
+CREATE OR REPLACE PROCEDURE assign_river_ids_by_huc()
+LANGUAGE plpgsql
+AS $$
+DECLARE
+    v_river_id INT := 0;
+BEGIN
+    RAISE NOTICE 'Assigning river IDs by HUC watershed...';
+    
+    -- Create temp table with name + HUC groupings
+    CREATE TEMP TABLE river_groups AS
+    SELECT 
+        gnis_name,
+        LEFT(r.region, 4) as huc4,  -- Use HUC4 for grouping
+        MIN(comid) as min_comid
+    FROM us.river_reach_profiles rp
+    JOIN public.river_edges r ON rp.comid = r.comid
+    WHERE gnis_name IS NOT NULL
+    GROUP BY gnis_name, LEFT(r.region, 4);
+    
+    -- Assign sequential IDs
+    UPDATE us.river_reach_profiles rp
+    SET river_id = rg.row_num
+    FROM (
+        SELECT 
+            gnis_name, 
+            huc4,
+            ROW_NUMBER() OVER (ORDER BY gnis_name, huc4) as row_num
+        FROM river_groups
+    ) rg
+    JOIN public.river_edges r ON rp.comid = r.comid
+    WHERE rp.gnis_name = rg.gnis_name
+      AND LEFT(r.region, 4) = rg.huc4;
+    
+    DROP TABLE river_groups;
+    
+    SELECT MAX(river_id) INTO v_river_id FROM us.river_reach_profiles;
+    RAISE NOTICE 'Assigned % unique river IDs', v_river_id;
+END;
+$$;
+
+-- ============================================================================
+-- UPDATE RIVER SUMMARY TO USE RIVER_ID
+-- ============================================================================
+CREATE OR REPLACE PROCEDURE refresh_river_summary()
+LANGUAGE plpgsql
+AS $$
+BEGIN
+    TRUNCATE us.river_summary;
+    
+    INSERT INTO us.river_summary (
+        river_id, gnis_name, primary_state, states,
+        total_length_km, reach_count, min_stream_order, max_stream_order,
+        min_elev_m, max_elev_m, total_drop_m, avg_gradient_m_per_km,
+        total_access_points, total_campgrounds, total_dams, total_rapids, total_waterfalls,
+        max_difficulty_score, max_difficulty_level, max_difficulty_label, avg_difficulty_score,
+        paddling_score, beginner_friendly_score,
+        bbox_min_lat, bbox_max_lat, bbox_min_lon, bbox_max_lon,
+        search_text
+    )
+    SELECT 
+        river_id,
+        gnis_name,
+        MODE() WITHIN GROUP (ORDER BY state) as primary_state,
+        ARRAY_AGG(DISTINCT state ORDER BY state) FILTER (WHERE state IS NOT NULL) as states,
+        SUM(length_km) as total_length_km,
+        COUNT(*) as reach_count,
+        MIN(stream_order) as min_stream_order,
+        MAX(stream_order) as max_stream_order,
+        MIN(min_elev_m) as min_elev_m,
+        MAX(max_elev_m) as max_elev_m,
+        MAX(max_elev_m) - MIN(min_elev_m) as total_drop_m,
+        AVG(gradient_m_per_km) as avg_gradient_m_per_km,
+        SUM(access_point_count) as total_access_points,
+        SUM(campground_count) as total_campgrounds,
+        SUM(dam_count) as total_dams,
+        SUM(rapid_count) as total_rapids,
+        SUM(waterfall_count) as total_waterfalls,
+        MAX(difficulty_score) as max_difficulty_score,
+        MAX(difficulty_level) as max_difficulty_level,
+        MAX(difficulty_label) as max_difficulty_label,
+        AVG(difficulty_score) as avg_difficulty_score,
+        AVG(paddling_score) as paddling_score,
+        AVG(beginner_friendly_score) as beginner_friendly_score,
+        MIN(centroid_lat) as bbox_min_lat,
+        MAX(centroid_lat) as bbox_max_lat,
+        MIN(centroid_lon) as bbox_min_lon,
+        MAX(centroid_lon) as bbox_max_lon,
+        to_tsvector('english', 
+            gnis_name || ' ' || 
+            COALESCE(array_to_string(ARRAY_AGG(DISTINCT state), ' '), '')
+        )
+    FROM us.river_reach_profiles
+    WHERE gnis_name IS NOT NULL
+      AND river_id IS NOT NULL
+    GROUP BY river_id, gnis_name;
+    
+    RAISE NOTICE 'River summary refreshed with river_id';
+END;
+$$;
+
+-- Create unique constraint on river_id
+CREATE UNIQUE INDEX IF NOT EXISTS idx_rs_river_id ON us.river_summary(river_id);
+
+-- Index for looking up by river_id
+CREATE INDEX IF NOT EXISTS idx_rrp_river_id ON us.river_reach_profiles(river_id);
+
+-- ============================================================================
+-- UPDATED ROUTE FINDING (uses river_id)
+-- ============================================================================
+DROP FUNCTION IF EXISTS find_float_route;
+
+CREATE OR REPLACE FUNCTION find_float_route(
+    p_river_id INT,                  -- Use river_id instead of name+state
+    p_target_hours NUMERIC,
+    p_tolerance_hours NUMERIC DEFAULT 0.5,
+    p_max_difficulty INT DEFAULT 5
+) RETURNS TABLE (
+    route_id INT,
+    comid BIGINT,
+    river_id INT,
+    gnis_name TEXT,
+    state TEXT,
+    reach_order INT,
+    length_km NUMERIC,
+    float_hours NUMERIC,
+    cumulative_hours NUMERIC,
+    difficulty_level INT,
+    has_put_in BOOLEAN,
+    has_take_out BOOLEAN,
+    access_points JSONB
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH ordered_reaches AS (
+        SELECT 
+            rrp.comid,
+            rrp.river_id,
+            rrp.gnis_name,
+            rrp.state,
+            ROW_NUMBER() OVER (ORDER BY rrp.hydroseq DESC) as reach_order,
+            rrp.length_km,
+            rrp.estimated_float_hours,
+            rrp.difficulty_level,
+            rrp.has_put_in,
+            rrp.has_take_out,
+            rrp.access_points as aps
+        FROM us.river_reach_profiles rrp
+        WHERE rrp.river_id = p_river_id
+          AND COALESCE(rrp.difficulty_level, 1) <= p_max_difficulty
+        ORDER BY rrp.hydroseq DESC
+    ),
+    route_windows AS (
+        SELECT 
+            r1.reach_order as start_reach,
+            r2.reach_order as end_reach,
+            SUM(r3.estimated_float_hours) as total_hours
+        FROM ordered_reaches r1
+        CROSS JOIN ordered_reaches r2
+        JOIN ordered_reaches r3 
+            ON r3.reach_order BETWEEN r1.reach_order AND r2.reach_order
+        WHERE r2.reach_order >= r1.reach_order
+        GROUP BY r1.reach_order, r2.reach_order
+        HAVING SUM(r3.estimated_float_hours) BETWEEN (p_target_hours - p_tolerance_hours) 
+                                                  AND (p_target_hours + p_tolerance_hours)
+    ),
+    best_route AS (
+        SELECT rw.*
+        FROM route_windows rw
+        ORDER BY 
+            (SELECT or1.has_put_in FROM ordered_reaches or1 WHERE or1.reach_order = rw.start_reach)::int +
+            (SELECT or2.has_take_out FROM ordered_reaches or2 WHERE or2.reach_order = rw.end_reach)::int DESC,
+            ABS(rw.total_hours - p_target_hours) ASC
+        LIMIT 1
+    )
+    SELECT 
+        1 as route_id,
+        orp.comid,
+        orp.river_id,
+        orp.gnis_name,
+        orp.state,
+        orp.reach_order::INT,
+        orp.length_km,
+        orp.estimated_float_hours,
+        SUM(orp.estimated_float_hours) OVER (ORDER BY orp.reach_order) as cumulative_hours,
+        orp.difficulty_level,
+        orp.has_put_in,
+        orp.has_take_out,
+        orp.aps
+    FROM ordered_reaches orp
+    JOIN best_route br ON orp.reach_order BETWEEN br.start_reach AND br.end_reach
+    ORDER BY orp.reach_order;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- HELPER: Find river_id by name (with disambiguation)
+-- ============================================================================
+CREATE OR REPLACE FUNCTION find_river_id(
+    p_river_name TEXT,
+    p_state TEXT DEFAULT NULL
+) RETURNS TABLE (
+    river_id INT,
+    gnis_name TEXT,
+    states TEXT[],
+    total_length_km NUMERIC,
+    reach_count INT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT 
+        rs.river_id,
+        rs.gnis_name,
+        rs.states,
+        rs.total_length_km,
+        rs.reach_count
+    FROM us.river_summary rs
+    WHERE rs.gnis_name ILIKE '%' || p_river_name || '%'
+      AND (p_state IS NULL OR p_state = ANY(rs.states))
+    ORDER BY rs.total_length_km DESC;
+END;
+$$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- EXAMPLE QUERIES
+-- ============================================================================
+/*
+-- Find all rivers named "White River" and their IDs
+SELECT * FROM find_river_id('White River');
+-- Returns:
+-- river_id | gnis_name    | states           | total_length_km
+-- 1234     | White River  | {VT}             | 89.2
+-- 5678     | White River  | {AR,MO}          | 1102.4
+-- 9012     | White River  | {IN}             | 362.1
+
+-- Find specifically the White River that flows through Vermont
+SELECT * FROM find_river_id('White River', 'VT');
+
+-- Get a 2-hour float on river_id 1234 (White River, VT)
+SELECT * FROM find_float_route(1234, 2.0);
+
+-- Connecticut River (flows through 4 states) = single river_id
+SELECT * FROM find_river_id('Connecticut River');
+-- Returns ONE row with states = {NH, VT, MA, CT}
+*/
